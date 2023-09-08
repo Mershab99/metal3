@@ -1,0 +1,137 @@
+
+cache:
+  key: ${HELM_DIRECTORY}-${CI_COMMIT_SHORT_SHA}
+  paths:
+    - ${HELM_DIRECTORY}/
+
+variables:
+  #HELM VARIABLES
+  HELM_CHANNEL_PREFIX: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/
+  HELM_CHANNEL: stable
+  HELM_DIRECTORY: .
+  VALUES_FILE: ${HELM_DIRECTORY}/values.yaml
+  HELM_IMAGE_TAG: $DOCKER_IMAGE_TAG
+  HELM_CHART_NAME: $CI_PROJECT_NAME
+  HELM_CHART_VERSION: '0.1.0'
+  IMAGE_RENAME: "true"
+
+stages:
+  - pre
+  - build
+  - validate
+  - package-push-helm
+
+semantic-versioning-tag:
+  image: alpine:3.17
+  before_script:
+    - apk update 
+    - apk add git
+  stage: pre
+  script:
+    - |
+      if git show-ref --tags >/dev/null 2>&1; then
+        LAST_TAG=$(git describe --abbrev=0 --tags)
+        LAST_TAG_NUMBER=$(echo "$LAST_TAG" | awk -F. '{ print $NF }')
+        NEW_MINOR_VERSION=$((LAST_TAG_NUMBER + 1))
+        NEW_CHART_VERSION=$(echo "$HELM_CHART_VERSION" | awk -F. -v minor="$NEW_MINOR_VERSION" '{$2=minor; print}' OFS=.)
+        echo "LAST_TAG=$LAST_TAG" > build.env
+        echo "LAST_TAG_NUMBER=$LAST_TAG_NUMBER" >> build.env
+        echo "NEW_CHART_VERSION=$NEW_CHART_VERSION" >> build.env
+        echo $NEW_CHART_VERSION
+      else
+        NEW_CHART_VERSION=$(echo "$HELM_CHART_VERSION")
+        echo "NEW_CHART_VERSION=$NEW_CHART_VERSION" >> build.env
+        echo $NEW_CHART_VERSION
+        echo "No Git tags found. Skipping versioning."
+      fi
+  artifacts:
+    reports:
+      dotenv: build.env
+
+build-helm:
+  stage: build
+    #    - semantic-versioning-tag
+#  dependencies:
+  image:
+    name: alpine/helm:3.6.0
+    entrypoint: [""]
+  variables:
+    HELM_DIR: $HELM_DIRECTORY
+    HELM_CHART_REPO: ${HELM_CHANNEL_PREFIX}${HELM_CHANNEL}
+  before_script:
+    - set -x
+    - apk update 
+    - apk add git
+    - helm plugin install --version=v0.9.0 https://github.com/chartmuseum/helm-push.git
+    - >
+      helm repo add ${CI_PROJECT_NAME}
+      --username ${CI_REGISTRY_USER}
+      --password ${CI_REGISTRY_PASSWORD}
+      ${HELM_CHART_REPO}
+  script:
+      - cd $HELM_DIR
+        #- helm lint .
+      - helm dep update .
+      - helm dep build .
+  cache:
+    key: ${HELM_DIRECTORY}-${CI_COMMIT_SHORT_SHA}
+    paths:
+      - ${HELM_DIRECTORY}/
+
+template-helm:
+  stage: validate
+  needs:
+    - build-helm
+  image:
+    name: alpine/helm:3.6.0
+    entrypoint: [""]
+  variables:
+    HELM_DIR: ${HELM_DIRECTORY}
+    RELEASE_NAME: "tb-release"
+  script:
+    - set -x
+    - apk add git
+    - apk add --no-cache yq
+    - echo $RELEASE_NAME
+    - helm template --debug $RELEASE_NAME $HELM_DIR > manifest.yaml
+    - cat manifest.yaml | yq e -C
+  allow_failure: true
+  artifacts:
+    paths:
+      - manifest.yaml
+
+
+publish-push-helm:
+  needs:
+    - build-helm
+    - semantic-versioning-tag
+  stage: package-push-helm
+  image:
+    name: alpine/helm:3.6.0
+    entrypoint: [""]
+  variables:
+    HELM_DIR: $HELM_DIRECTORY
+    HELM_CHART_REPO: ${HELM_CHANNEL_PREFIX}${HELM_CHANNEL}
+  before_script:
+    - set -x
+    - apk add git
+    - helm plugin install --version=v0.9.0 https://github.com/chartmuseum/helm-push.git
+    - >
+      helm repo add ${CI_PROJECT_NAME}
+      --username ${CI_REGISTRY_USER}
+      --password ${CI_REGISTRY_PASSWORD}
+      ${HELM_CHART_REPO}
+  script:
+
+    - cd $HELM_DIR
+    - helm package . --version ${NEW_CHART_VERSION}
+    - helm push ${HELM_CHART_NAME}-${NEW_CHART_VERSION}.tgz ${CI_PROJECT_NAME}
+  cache:
+    key: ${HELM_DIRECTORY}-${CI_COMMIT_SHORT_SHA}
+    paths:
+      - ${HELM_DIRECTORY}/
+  artifacts:
+    paths:
+      - ${HELM_DIRECTORY}/${HELM_CHART_NAME}*.tgz
+
+
